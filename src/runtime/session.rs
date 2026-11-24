@@ -406,22 +406,44 @@ fn session_resumed(params: &ConnectParams, connack: &ConnAck) -> bool {
 /// one is logged with its reason, and a summary follows. A store that
 /// cannot even be listed does fail the connection, in [`read_store`], since
 /// it would otherwise look exactly like an empty one.
+///
+/// A store lists its keys in no particular order, so outbound entries are
+/// reinstated in the order of the sequence number each carries (see
+/// [`SeqTrailer`]): the order they were first published in, which is the
+/// order a resumed session must re-send them in (§4.6). Entries written by
+/// earlier versions carry none. They are older than any that do, so they go
+/// first, by packet identifier: each takes its identifier as its sequence
+/// number, below [`SeqTrailer::FIRST`], where the numbers handed out start.
+/// It keeps that number if its entry is later rewritten as a PUBREL.
 fn load_persisted(
     state: &mut SessionState,
     entries: Vec<StoredEntry>,
     ver: MqttVersion,
 ) -> Restored {
     let mut restored = Restored::default();
+    let mut outbound = Vec::new();
     for entry in entries {
         let key = entry.key.clone();
         match restore_entry(state, entry, ver) {
-            Ok(Restore::Outbound) => restored.outbound += 1,
+            Ok(Restore::Outbound(rec)) => outbound.push(rec),
             Ok(Restore::Inbound) => restored.inbound += 1,
             Err(why) => {
                 warn!("Skipped persisted entry {key:?} while restoring the session: {why}");
                 restored.skipped += 1;
             }
         }
+    }
+
+    let seq_of = |r: &RestoredOutbound| r.seq.unwrap_or(u64::from(r.id));
+    outbound.sort_unstable_by_key(|r| (seq_of(r), r.id));
+    restored.outbound = outbound.len();
+    for r in outbound {
+        let seq = seq_of(&r);
+        // `SeqTrailer::decode` bounds what a store can claim, so this
+        // cannot overflow.
+        state.next_seq = state.next_seq.max(seq + 1);
+        state.next_id = state.next_id.max(r.id);
+        state.insert_at(r.id, Completer::orphan(), r.phase, false, seq);
     }
 
     if restored.skipped > 0 {
@@ -492,10 +514,59 @@ struct Restored {
     skipped: usize,
 }
 
-/// Which half of the session state a restored entry went into.
+/// Which half of the session state a restored entry goes into. An inbound
+/// one is reinstated at once; an outbound one is handed back, to be put in
+/// publish order with the others first.
 enum Restore {
-    Outbound,
+    Outbound(RestoredOutbound),
     Inbound,
+}
+
+/// An outbound entry read back from the store, not yet reinstated.
+struct RestoredOutbound {
+    id: u16,
+    phase: PublishPhase,
+    /// Where it stood in publish order, if the entry says (see
+    /// [`SeqTrailer`]).
+    seq: Option<u64>,
+}
+
+/// The few bytes stored after the packet in an outbound (`s`) entry: a
+/// marker and the message's sequence number, so that a restored session
+/// can re-send its messages in the order they were published (§4.6) — the
+/// store's keys come back in no particular order. Earlier versions of the
+/// client neither write it nor mind it: they read the packet and ignore
+/// whatever follows.
+struct SeqTrailer;
+
+impl SeqTrailer {
+    const MAGIC: &'static [u8; 4] = b"SEQ1";
+    const LEN: usize = 12;
+    /// The first sequence number handed out. Those below it are left for
+    /// entries that carry none, which take their packet identifier.
+    const FIRST: u64 = 1 << 16;
+    /// More than a session could ever hand out. A larger number in a store
+    /// is damage, and is not believed.
+    const LIMIT: u64 = 1 << 62;
+
+    fn encode(seq: u64) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[..4].copy_from_slice(Self::MAGIC);
+        b[4..].copy_from_slice(&seq.to_be_bytes());
+        b
+    }
+
+    /// The sequence number in `rest`, what follows the packet in an entry,
+    /// or `None` if it holds none (an entry from an earlier version) or
+    /// one that cannot be right.
+    fn decode(rest: &[u8]) -> Option<u64> {
+        if rest.len() == Self::LEN && rest.starts_with(Self::MAGIC) {
+            let seq = u64::from_be_bytes(rest[4..].try_into().ok()?);
+            (seq < Self::LIMIT).then_some(seq)
+        } else {
+            None
+        }
+    }
 }
 
 /// Reads one persisted entry back into `state`, or says why it cannot be.
@@ -525,6 +596,7 @@ fn restore_entry(
     };
     let pkt =
         Packet::from_raw(raw, ver).map_err(|e| format!("it is not a valid {ver} packet ({e})"))?;
+    let seq = SeqTrailer::decode(&buf);
 
     let check_id = |id: Option<u16>| match id {
         Some(id) if id == key_id => Ok(id),
@@ -545,25 +617,19 @@ fn restore_entry(
                 );
             }
             pub_pkt.properties.remove(PropertyId::TopicAlias);
-            state.next_id = state.next_id.max(id);
-            state.insert(
+            Ok(Restore::Outbound(RestoredOutbound {
                 id,
-                Completer::orphan(),
-                PublishPhase::AwaitingAck(Box::new(pub_pkt)),
-                false,
-            );
-            Ok(Restore::Outbound)
+                phase: PublishPhase::AwaitingAck(Box::new(pub_pkt)),
+                seq,
+            }))
         }
         (b's', Packet::PubRel(rel)) => {
             let id = check_id(Some(rel.packet_id))?;
-            state.next_id = state.next_id.max(id);
-            state.insert(
+            Ok(Restore::Outbound(RestoredOutbound {
                 id,
-                Completer::orphan(),
-                PublishPhase::AwaitingPubComp,
-                false,
-            );
-            Ok(Restore::Outbound)
+                phase: PublishPhase::AwaitingPubComp,
+                seq,
+            }))
         }
         (b'r', Packet::Publish(pub_pkt)) => {
             let id = check_id(pub_pkt.packet_id)?;
@@ -770,8 +836,23 @@ impl OutboundAliases {
 
 impl SessionState {
     /// Records `record` under `id`, stamped with the next sequence number.
+    #[cfg(test)]
     fn insert(&mut self, id: u16, tx: Completer<PublishResponse>, phase: PublishPhase, sent: bool) {
         let seq = self.take_seq();
+        self.insert_at(id, tx, phase, sent, seq);
+    }
+
+    /// Records `record` under `id` with the sequence number `seq`, one
+    /// taken earlier with [`take_seq`](Self::take_seq) or read back from
+    /// the store.
+    fn insert_at(
+        &mut self,
+        id: u16,
+        tx: Completer<PublishResponse>,
+        phase: PublishPhase,
+        sent: bool,
+        seq: u64,
+    ) {
         let rec = InflightPublish {
             tx,
             phase,
@@ -858,9 +939,12 @@ impl SessionState {
     }
 
     /// The next sequence number, for an operation first handed over now.
+    ///
+    /// They start at [`SeqTrailer::FIRST`]: the numbers below it belong to
+    /// messages restored from a store written before entries carried one.
     fn take_seq(&mut self) -> u64 {
-        let seq = self.next_seq;
-        self.next_seq += 1;
+        let seq = self.next_seq.max(SeqTrailer::FIRST);
+        self.next_seq = seq + 1;
         seq
     }
 
@@ -1653,34 +1737,37 @@ impl<B: Backend> Session<B> {
         }
     }
 
-    /// Persists the frame just queued (see [`Outbox::last_frame`]) under the
-    /// key for `kind` and `id`. Nothing queued is written before the handler
+    /// Persists the frame just queued (see [`Outbox::last_frame`]) as the
+    /// outbound entry for `id`, followed by its place `seq` in publish order
+    /// (see [`SeqTrailer`]). Nothing queued is written before the handler
     /// returns, so the frame is stored before it is sent.
-    fn persist_last_frame(&mut self, kind: u8, id: u16) {
+    fn persist_last_frame(&mut self, id: u16, seq: u64) {
         if !self.persist.is_some() {
             return;
         }
         let gate_at = self.out.last_frame_start();
+        let key = PersistKey::new(b's', id);
+        let trailer = SeqTrailer::encode(seq);
         match &mut self.persist {
             // The worker needs data of its own: the header is copied out
             // of the encode buffer, which the outbox goes on using, and a
             // large payload is a `Bytes` clone, which copies nothing.
             Persist::Worker(w) => {
-                let key = PersistKey::new(kind, id);
-                let seq = w.put(key.as_str().to_string(), self.out.last_frame_owned());
-                self.hold_until_stored(seq, gate_at);
+                let mut parts = self.out.last_frame_owned();
+                parts.push(Bytes::copy_from_slice(&trailer));
+                let done = w.put(key.as_str().to_string(), parts);
+                self.hold_until_stored(done, gate_at);
             }
             _ => {
                 let [hdr, payload] = self.out.last_frame();
                 let parts: &[&[u8]] = if payload.is_empty() {
-                    &[hdr]
+                    &[hdr, &trailer]
                 } else {
-                    &[hdr, payload]
+                    &[hdr, payload, &trailer]
                 };
                 // Borrowed from the outbox, so it cannot go through
                 // `persist_put`, which takes `&mut self`.
                 if let Persist::Inline(store) = &self.persist {
-                    let key = PersistKey::new(kind, id);
                     let _ = persist::call(store, |s| s.put(key.as_str(), parts.to_vec()));
                 }
             }
@@ -1691,15 +1778,16 @@ impl<B: Backend> Session<B> {
     /// it, as the outbound entry for `id`. The frame is held back until the
     /// store has it, as [`persist_last_frame`](Self::persist_last_frame)
     /// holds it.
-    fn persist_publish(&mut self, id: u16, packet: &Packet) {
+    fn persist_publish(&mut self, id: u16, seq: u64, packet: &Packet) {
         if !self.persist.is_some() {
             return;
         }
         let gate_at = self.out.last_frame_start();
+        let trailer = SeqTrailer::encode(seq);
         let mut hdr = BytesMut::new();
         match packet.encode_split(&mut hdr, self.ver) {
-            Ok(Some(payload)) => self.persist_put(b's', id, &[&hdr, &payload], gate_at),
-            Ok(None) => self.persist_put(b's', id, &[&hdr], gate_at),
+            Ok(Some(payload)) => self.persist_put(b's', id, &[&hdr, &payload, &trailer], gate_at),
+            Ok(None) => self.persist_put(b's', id, &[&hdr, &trailer], gate_at),
             Err(e) => warn!("Could not persist outbound message {id}: {e}"),
         }
     }
@@ -2534,8 +2622,9 @@ impl<B: Backend> Session<B> {
                 // step, so a crash now cannot resurrect the message.
                 if let Some(inflight) = self.state.mark_sent(rec.packet_id) {
                     inflight.phase = PublishPhase::AwaitingPubComp;
+                    let seq = inflight.seq;
                     self.queue_reply(&Packet::PubRel(PubAck::new(rec.packet_id)))?;
-                    self.persist_last_frame(b's', rec.packet_id);
+                    self.persist_last_frame(rec.packet_id, seq);
                 } else {
                     // Not one of ours. The server still gets its PUBREL, to
                     // finish its side — in v5 saying the identifier is not
@@ -2863,14 +2952,17 @@ impl<B: Backend> Session<B> {
                 // A QoS 1/2 PUBLISH is kept for re-sending, in memory and in
                 // the store (for after a crash): exactly as queued, or, if
                 // it used an alias, with the topic name in its place.
+                // Its place in publish order, stored with it so that a
+                // restored session re-sends in that order.
+                let seq = self.state.take_seq();
                 if let Some(pid) = id {
                     match aliased {
-                        None => self.persist_last_frame(b's', pid),
+                        None => self.persist_last_frame(pid, seq),
                         Some((_, name)) => {
                             pub_pkt.topic = name;
                             pub_pkt.properties.remove(PropertyId::TopicAlias);
                             let packet = Packet::Publish(pub_pkt);
-                            self.persist_publish(pid, &packet);
+                            self.persist_publish(pid, seq, &packet);
                             let Packet::Publish(p) = packet else {
                                 unreachable!()
                             };
@@ -2886,11 +2978,12 @@ impl<B: Backend> Session<B> {
                     // as sent: if the session ends before the bytes leave,
                     // re-sending it is what a resumed session does anyway.
                     Some(id) => {
-                        self.state.insert(
+                        self.state.insert_at(
                             id,
                             tx,
                             PublishPhase::AwaitingAck(Box::new(pub_pkt)),
                             true,
+                            seq,
                         );
                     }
                 }
@@ -5222,6 +5315,75 @@ mod tests {
         let sent: Vec<String> = sent_packets(&mut h).iter().map(describe).collect();
         assert_eq!(sent.len(), 1);
         assert!(sent[0].starts_with("SUBSCRIBE") && sent[0].ends_with("a/#"));
+    }
+
+    /// A store lists its keys in no particular order, but a session
+    /// restored from one re-sends in publish order (§4.6): each outbound
+    /// entry carries its place, which a PUBLISH replaced by its PUBREL
+    /// keeps. Entries from earlier versions, which carry none, are older
+    /// and go first, by packet identifier. A place no session could have
+    /// reached is damage: the entry is treated as carrying none.
+    #[test]
+    fn test_restored_session_resends_in_publish_order() {
+        let store = store_with(&[]);
+        let mut first = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+        first.session.persist = Persist::Inline(store.clone());
+        for topic in ["a", "b", "c"] {
+            let (_tok, c) = publish_cmd(topic, QoS::QoS2, Bytes::from_static(b"x"));
+            first.session.handle_command(c).unwrap();
+        }
+        // The first is PUBREC'd: its entry is now a PUBREL.
+        first
+            .session
+            .handle_packet(Packet::PubRec(PubAck::new(1)))
+            .unwrap();
+        drop(first);
+
+        // A legacy entry, with no sequence number.
+        let body = Bytes::from_static(b"x");
+        store
+            .lock()
+            .unwrap()
+            .put("s9", vec![&wire_publish("old", QoS::QoS1, Some(9), &body)])
+            .unwrap();
+
+        // Listed in the worst order: newest first.
+        let mut entries = persist::call(&store, read_store).unwrap();
+        entries.sort_by(|a, b| b.key.cmp(&a.key));
+        let mut state = SessionState::default();
+        let restored = load_persisted(&mut state, entries, MqttVersion::V5);
+        assert_eq!(restored.outbound, 4);
+
+        let mut second = harness(BytesMut::new(), Duration::ZERO, state);
+        second.session.resume(true);
+        let resent: Vec<String> = sent_packets(&mut second).iter().map(describe).collect();
+        assert_eq!(
+            resent,
+            [
+                "PUBLISH old Some(9) dup=true",
+                "PubRel",
+                "PUBLISH b Some(2) dup=true",
+                "PUBLISH c Some(3) dup=true",
+            ]
+        );
+        assert_eq!(second.session.state.inflight[&9].seq, 9);
+        assert_eq!(SeqTrailer::decode(&SeqTrailer::encode(u64::MAX)), None);
+        let first = SeqTrailer::FIRST;
+        assert_eq!(SeqTrailer::decode(&SeqTrailer::encode(first)), Some(first));
+
+        // A message published now goes after them, and is stored after them.
+        let (_tok, c) = publish_cmd("d", QoS::QoS1, Bytes::from_static(b"x"));
+        second.session.persist = Persist::Inline(store.clone());
+        second.session.handle_command(c).unwrap();
+        let d_seq = second.session.state.inflight[&10].seq;
+        assert!(
+            second
+                .session
+                .state
+                .inflight
+                .values()
+                .all(|r| r.seq <= d_seq)
+        );
     }
 
     /// The next server may take smaller packets than the last one did.
