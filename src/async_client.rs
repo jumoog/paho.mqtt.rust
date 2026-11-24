@@ -1017,7 +1017,7 @@ impl AsyncClient {
         let qos = qos.try_into().map_err(Into::into)?;
         let opts: SubscribeOptions = opts.into();
         let props = props.into().unwrap_or_default();
-        self.require_v5_for_sub_opts(&opts)?;
+        self.check_sub_opts(&topic, &opts)?;
         self.require_v5_for_props(&props)?;
         check_packet_props(&props, paho_mqtt_codec::PacketType::Subscribe)?;
 
@@ -1207,7 +1207,7 @@ impl AsyncClient {
             .enumerate()
             .map(|(i, (t, q))| {
                 let sub_opts = opts.get(i).copied().unwrap_or_default();
-                self.require_v5_for_sub_opts(&sub_opts)?;
+                self.check_sub_opts(t.as_ref(), &sub_opts)?;
                 let qos = (*q).try_into().map_err(Into::into)?;
                 Ok((t.as_ref().to_string(), qos, sub_opts))
             })
@@ -1938,15 +1938,21 @@ impl AsyncClient {
         }
     }
 
-    /// Returns `Err(WrongMqttVersion)` if any v5-only subscription option is
-    /// set but the current connection is not MQTT v5.
-    fn require_v5_for_sub_opts(&self, opts: &SubscribeOptions) -> Result<()> {
+    /// Checks the subscription options `opts` for `filter`: any v5-only
+    /// option on a connection that is not MQTT v5 is `Err(WrongMqttVersion)`,
+    /// and No Local on a shared subscription, which the server must treat
+    /// as a Protocol Error (§3.8.3.1, [MQTT-3.8.3-4]), is `InvalidArgument`.
+    fn check_sub_opts(&self, filter: &str, opts: &SubscribeOptions) -> Result<()> {
         if self.mqtt_version() < MqttVersion::V5
             && (opts.no_local
                 || opts.retain_as_published
                 || opts.retain_handling != crate::subscribe_options::RetainHandling::default())
         {
             Err(Error::WrongMqttVersion)
+        } else if opts.no_local && filter.starts_with(paho_mqtt_codec::topic::SHARE_PREFIX) {
+            Err(Error::InvalidArgument(
+                "No Local cannot be set on a shared subscription".into(),
+            ))
         } else {
             Ok(())
         }
@@ -3184,6 +3190,33 @@ mod tests {
         assert!(matches!(
             cli.try_subscribe_many_with_options(&["a"], &[QoS::QoS1], &[opts], None),
             Err(Error::WrongMqttVersion)
+        ));
+    }
+
+    /// No Local on a shared subscription is refused before anything is
+    /// sent: the server would treat it as a Protocol Error [MQTT-3.8.3-4].
+    #[test]
+    fn test_try_subscribe_rejects_no_local_on_shared() {
+        let cli = AsyncClient::new(
+            CreateOptionsBuilder::new()
+                .server_uri("mqtt://localhost:1883")
+                .mqtt_version(MqttVersion::V5)
+                .finalize(),
+        )
+        .unwrap();
+        let opts = SubscribeOptions::with_no_local();
+        assert!(matches!(
+            cli.try_subscribe_with_options("$share/g/a/#", QoS::QoS1, opts, None),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            cli.try_subscribe_many_with_options(
+                &["a/b", "$share/g/a/#"],
+                &[QoS::QoS1, QoS::QoS1],
+                &[opts, opts],
+                None
+            ),
+            Err(Error::InvalidArgument(_))
         ));
     }
 

@@ -370,7 +370,10 @@ fn subscribe(u: &mut Unstructured, ver: MqttVersion) -> AResult<Subscribe> {
     for _ in 0..n {
         let mut s = Subscription::new(topic_filter(u)?, qos(u)?);
         if ver == MqttVersion::V5 {
-            s.no_local = u.arbitrary()?;
+            // No Local on a shared subscription is a Protocol Error
+            // [MQTT-3.8.3-4], which the encoder refuses.
+            let no_local: bool = u.arbitrary()?;
+            s.no_local = no_local && !s.topic_filter.starts_with(topic::SHARE_PREFIX);
             s.retain_as_published = u.arbitrary()?;
             s.retain_handling = *u.choose(&[
                 RetainHandling::SendOnSubscribe,

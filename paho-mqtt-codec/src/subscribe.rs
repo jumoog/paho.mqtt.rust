@@ -87,6 +87,19 @@ impl Subscription {
         }
     }
 
+    /// No Local on a shared subscription is a Protocol Error (§3.8.3.1,
+    /// [MQTT-3.8.3-4]). Only v5 has either.
+    fn check_no_local(&self, ver: MqttVersion) -> Result<()> {
+        if ver == MqttVersion::V5
+            && self.no_local
+            && self.topic_filter.starts_with(topic::SHARE_PREFIX)
+        {
+            Err(Error::ProtocolError)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Returns the encoded options byte for the given version, `ver`.
     fn options_byte(&self, ver: MqttVersion) -> u8 {
         let mut byte = self.qos as u8;
@@ -171,6 +184,7 @@ impl Subscribe {
         self.properties.encode(dst, ver)?;
         for sub in &self.subscriptions {
             topic::validate_filter(&sub.topic_filter)?;
+            sub.check_no_local(ver)?;
             put_utf8(&sub.topic_filter, dst)?;
             dst.put_u8(sub.options_byte(ver));
         }
@@ -215,13 +229,15 @@ impl Subscribe {
                 }
             };
 
-            subscriptions.push(Subscription {
+            let sub = Subscription {
                 topic_filter,
                 qos,
                 no_local,
                 retain_as_published,
                 retain_handling,
-            });
+            };
+            sub.check_no_local(ver)?;
+            subscriptions.push(sub);
         }
 
         if subscriptions.is_empty() {
@@ -579,6 +595,43 @@ mod tests {
     fn test_subscribe_shared_filter_round_trips() {
         let s = Subscribe::new(1, vec![sub("$share/group1/sport/#", QoS::AtLeastOnce)]);
         round_trip_subscribe(s, v5());
+    }
+
+    /// No Local on a shared subscription is a Protocol Error
+    /// [MQTT-3.8.3-4]: it is neither encoded nor accepted.
+    #[test]
+    fn test_subscribe_no_local_on_shared_is_protocol_error() {
+        let mut shared = sub("$share/g/a/b", QoS::AtLeastOnce);
+        shared.no_local = true;
+        let s = Subscribe::new(1, vec![shared.clone()]);
+        let mut buf = BytesMut::new();
+        assert!(matches!(
+            s.encode(&mut buf, v5()),
+            Err(Error::ProtocolError)
+        ));
+
+        // The same bytes from the other end.
+        shared.no_local = false;
+        let mut buf = BytesMut::new();
+        Subscribe::new(1, vec![shared])
+            .encode(&mut buf, v5())
+            .unwrap();
+        let last = buf.len() - 1;
+        buf[last] |= 0x04;
+        assert!(matches!(
+            Subscribe::decode(buf.freeze(), v5()),
+            Err(Error::ProtocolError)
+        ));
+
+        // Not shared: allowed.
+        let mut plain = sub("a/b", QoS::AtLeastOnce);
+        plain.no_local = true;
+        let mut buf = BytesMut::new();
+        assert!(
+            Subscribe::new(1, vec![plain])
+                .encode(&mut buf, v5())
+                .is_ok()
+        );
     }
 
     #[test]
