@@ -271,6 +271,7 @@ async fn recv_connack<B: Backend>(
     writer: &mut B::Writer,
     buf: &mut BytesMut,
     p: &ConnectParams,
+    last_sent: &mut Instant,
 ) -> Result<ConnAck> {
     loop {
         if B::read_buf(reader, buf).await? == 0 {
@@ -307,6 +308,7 @@ async fn recv_connack<B: Backend>(
                     Packet::Auth(reply).encode(&mut out, p.ver)?;
                     B::write_all(writer, &out).await?;
                     B::flush(writer).await?;
+                    *last_sent = Instant::now();
                 }
                 Packet::Auth(_) => {
                     return Err(Error::ProtocolViolation("unexpected AUTH reason code"));
@@ -1119,6 +1121,12 @@ impl Persist {
 struct Negotiated {
     ver: MqttVersion,
     keep_alive: Duration,
+    /// When the client last sent anything on this connection: the CONNECT,
+    /// or the last AUTH of the handshake. The Keep Alive interval runs from
+    /// then, not from when the session is built, which can be a good deal
+    /// later: a slow persistence store or a full event stream is waited on
+    /// in between, with nothing sent ([MQTT-3.1.2-20]).
+    last_sent: Instant,
     limits: SessionLimits,
     expiry: SessionExpiry,
 }
@@ -1160,8 +1168,9 @@ enum KeepAliveDue {
 }
 
 impl KeepAlive {
-    /// A connection that, as far as keep-alive is concerned, has just
-    /// exchanged CONNECT and CONNACK at `now`.
+    /// A connection whose handshake last sent something at `now`. Taken as
+    /// the last receipt too: the CONNACK came no earlier, and erring early
+    /// only brings a PINGREQ forward.
     fn new(period: Duration, now: Instant) -> Self {
         Self {
             period,
@@ -1355,6 +1364,7 @@ impl<B: Backend> Session<B> {
         let Negotiated {
             ver,
             keep_alive,
+            last_sent,
             limits,
             expiry,
         } = negotiated;
@@ -1391,7 +1401,7 @@ impl<B: Backend> Session<B> {
             server_disconnect: false,
             pending_ack: None,
             stalled_since: None,
-            ka: (!keep_alive.is_zero()).then(|| KeepAlive::new(keep_alive, Instant::now())),
+            ka: (!keep_alive.is_zero()).then(|| KeepAlive::new(keep_alive, last_sent)),
             persist,
             pending_puts: VecDeque::new(),
             limits,
@@ -3308,6 +3318,9 @@ struct Connected<B: Backend> {
     reader: B::Reader,
     writer: B::Writer,
     connack: ConnAck,
+    /// When the last packet of the handshake was sent: the CONNECT, or the
+    /// last AUTH of an enhanced authentication.
+    last_sent: Instant,
     /// Bytes that came in with the CONNACK and have not been parsed yet.
     ///
     /// A broker is free to pipeline packets behind the CONNACK — the queued
@@ -3370,15 +3383,20 @@ async fn do_connect<B: Backend>(
     Packet::Connect(Box::new(connect_pkt)).encode(&mut buf, p.ver)?;
     B::write_all(&mut writer, &buf).await?;
     B::flush(&mut writer).await?;
+    // The Keep Alive interval runs from here (§3.1.2.10): from the CONNECT,
+    // or the last AUTH that follows it.
+    let mut last_sent = Instant::now();
 
     // ---- Wait for CONNACK ----
     let mut read_buf = BytesMut::with_capacity(READ_BUF_CAPACITY);
-    let connack = recv_connack::<B>(&mut reader, &mut writer, &mut read_buf, p).await?;
+    let connack =
+        recv_connack::<B>(&mut reader, &mut writer, &mut read_buf, p, &mut last_sent).await?;
 
     Ok(Connected {
         reader,
         writer,
         connack,
+        last_sent,
         read_buf,
         stored,
     })
@@ -3964,6 +3982,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 mut reader,
                 writer,
                 connack,
+                last_sent,
                 read_buf,
                 stored,
             } = match attempt {
@@ -4056,6 +4075,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 Negotiated {
                     ver: job.params.ver,
                     keep_alive,
+                    last_sent,
                     limits,
                     expiry,
                 },
@@ -4434,6 +4454,7 @@ mod tests {
             Negotiated {
                 ver: MqttVersion::V5,
                 keep_alive,
+                last_sent: Instant::now(),
                 limits: test_limits(),
                 expiry: SessionExpiry::negotiated(
                     &params(MqttVersion::V3_1_1, false),
@@ -4865,6 +4886,7 @@ mod tests {
                 &mut writer,
                 &mut buf,
                 &params(ver, true),
+                &mut Instant::now(),
             ));
             assert!(matches!(res, Err(Error::ProtocolViolation(_))), "{ver}");
             let sent = writer.wire().bytes.clone();
@@ -4880,6 +4902,7 @@ mod tests {
                 &mut MockWriter::default(),
                 &mut BytesMut::new(),
                 &params(ver, false),
+                &mut Instant::now(),
             ));
             assert!(res.unwrap().session_present, "{ver}");
         }
@@ -6464,6 +6487,50 @@ mod tests {
         assert!(matches!(res, Err(Error::Timeout)), "{res:?}");
         assert!(start.elapsed() >= 2 * ka);
         assert_eq!(h.wire.wire().bytes, wire_packet(Packet::PingReq));
+    }
+
+    /// The Keep Alive interval runs from the last packet of the handshake
+    /// — the CONNECT, or the AUTH that answered a challenge — not from when
+    /// the session is built: whatever is waited on in between counts, so a
+    /// PINGREQ is due at once if that took an interval ([MQTT-3.1.2-20]).
+    #[test]
+    fn test_keep_alive_runs_from_the_handshake() {
+        let mut p = params(MqttVersion::V5, false);
+        p.props.push(Property::AuthenticationMethod("m".into()));
+        p.auth = Some(crate::AuthHandler::new(|_| Ok(Vec::new())));
+        let mut challenge = Properties::new();
+        challenge.push(Property::AuthenticationMethod("m".into()));
+        let auth = wire_packet(Packet::Auth(Auth::new(
+            ReasonCode::ContinueAuthentication,
+            challenge,
+        )));
+        let ack = wire_packet(Packet::ConnAck(ConnAck::new(false, ReasonCode::Success)));
+
+        let connect_sent = Instant::now() - Duration::from_secs(60);
+        let mut last_sent = connect_sent;
+        let res = futures::executor::block_on(recv_connack::<MockBackend>(
+            &mut MockReader::open_with([auth, ack.clone()]),
+            &mut MockWriter::default(),
+            &mut BytesMut::new(),
+            &p,
+            &mut last_sent,
+        ));
+        assert!(res.is_ok(), "{res:?}");
+        assert!(last_sent > connect_sent, "the AUTH reply was a send");
+
+        // No AUTH: the CONNECT is the last thing sent.
+        let mut last_sent = connect_sent;
+        futures::executor::block_on(recv_connack::<MockBackend>(
+            &mut MockReader::open_with([ack]),
+            &mut MockWriter::default(),
+            &mut BytesMut::new(),
+            &params(MqttVersion::V5, false),
+            &mut last_sent,
+        ))
+        .unwrap();
+        assert_eq!(last_sent, connect_sent);
+        let ka = KeepAlive::new(Duration::from_secs(10), last_sent);
+        assert_eq!(ka.due(Instant::now()), KeepAliveDue::Ping);
     }
 
     /// The keep-alive rules, on synthetic times: a PINGREQ is due once
