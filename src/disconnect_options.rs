@@ -103,6 +103,10 @@ impl DisconnectOptionsBuilder {
     ///
     /// The valid disconnect reasons are listed here in the spec:
     /// <https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901208>
+    ///
+    /// Only those the table gives as sent by a client are accepted:
+    /// `disconnect()` fails with `Error::InvalidArgument` for one that is
+    /// the server's to send, such as `ServerShuttingDown`.
     pub fn reason_code(&mut self, reason_code: ReasonCode) -> &mut Self {
         self.0.reason_code = reason_code;
         self

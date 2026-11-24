@@ -98,6 +98,39 @@ where
     Ok(())
 }
 
+/// Checks that `rc` is a reason a *client* may give in its DISCONNECT. The
+/// table in v5 §3.14.2.1 says who sends each one, and a client must use one
+/// of its own ([MQTT-3.14.2-1]): the rest are the server's to say — Server
+/// shutting down, Session taken over, Use another server and so on — or do
+/// not belong in a DISCONNECT at all.
+fn check_client_disconnect_reason(rc: ReasonCode) -> Result<()> {
+    use ReasonCode::*;
+    if rc == ReasonCode::NormalDisconnection
+        || matches!(
+            rc,
+            DisconnectWithWillMessage
+                | UnspecifiedError
+                | MalformedPacket
+                | ProtocolError
+                | ImplementationSpecificError
+                | TopicNameInvalid
+                | ReceiveMaximumExceeded
+                | TopicAliasInvalid
+                | PacketTooLarge
+                | MessageRateTooHigh
+                | QuotaExceeded
+                | AdministrativeAction
+                | PayloadFormatInvalid
+        )
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument(format!(
+            "{rc:?} is not a reason code a client may send in a DISCONNECT"
+        )))
+    }
+}
+
 /// Checks the properties the application gave for a packet of type `ty`:
 /// that each is one such a packet may carry (v5 §2.2.2.2), with a valid
 /// value. The codec would refuse to encode the packet otherwise, which the
@@ -730,6 +763,7 @@ impl AsyncClient {
         // be sent.
         self.require_v5_for_props(&opts.props)?;
         self.require_v5_for_disconnect_reason(opts.reason_code)?;
+        check_client_disconnect_reason(opts.reason_code)?;
         self.check_disconnect_props(&opts.props)?;
 
         let (tok, comp) = Token::<()>::new();
@@ -3094,6 +3128,46 @@ mod tests {
             Err(Error::WrongMqttVersion)
         ));
         assert_eq!(*calls.lock().unwrap(), 0, "the stream was ended");
+    }
+
+    /// A client gives only the reasons §3.14.2.1 lists as a client's: one
+    /// that is the server's to say, or that no DISCONNECT carries, is
+    /// refused before anything is queued ([MQTT-3.14.2-1]).
+    #[test]
+    fn test_try_disconnect_rejects_a_server_only_reason() {
+        let cli = AsyncClient::new(
+            CreateOptionsBuilder::new()
+                .server_uri("mqtt://localhost:1883")
+                .mqtt_version(MqttVersion::V5)
+                .finalize(),
+        )
+        .unwrap();
+        let with = |rc| {
+            cli.try_disconnect(
+                crate::DisconnectOptionsBuilder::new()
+                    .reason_code(rc)
+                    .finalize(),
+            )
+        };
+        for rc in [
+            ReasonCode::ServerShuttingDown,
+            ReasonCode::SessionTakenOver,
+            ReasonCode::UseAnotherServer,
+            ReasonCode::NotAuthorized,
+            ReasonCode::KeepAliveTimeout,
+            ReasonCode::GrantedQos1,
+        ] {
+            assert!(matches!(with(rc), Err(Error::InvalidArgument(_))), "{rc:?}");
+        }
+        for rc in [
+            ReasonCode::NormalDisconnection,
+            ReasonCode::DisconnectWithWillMessage,
+            ReasonCode::ProtocolError,
+            ReasonCode::PayloadFormatInvalid,
+        ] {
+            assert!(check_client_disconnect_reason(rc).is_ok(), "{rc:?}");
+        }
+        assert!(with(ReasonCode::DisconnectWithWillMessage).is_ok());
     }
 
     /// With the command channel closed the disconnect can't be queued.
