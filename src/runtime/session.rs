@@ -2820,7 +2820,21 @@ impl<B: Backend> Session<B> {
                 return Err(Error::Disconnected);
             }
 
-            _ => {} // ignore unexpected packets
+            // ---- Packets only a client sends, or a second CONNACK ----
+            // CONNECT, CONNACK, SUBSCRIBE, UNSUBSCRIBE and PINGREQ never come
+            // from a server once the connection is up. Receiving one is a
+            // Protocol Error (§4.13): the session ends, telling the server
+            // why on v5.
+            Packet::Connect(_)
+            | Packet::ConnAck(_)
+            | Packet::Subscribe(_)
+            | Packet::Unsubscribe(_)
+            | Packet::PingReq => {
+                return Err(Error::ReasonCode(
+                    ReasonCode::ProtocolError,
+                    Properties::new(),
+                ));
+            }
         }
         Ok(())
     }
@@ -5898,6 +5912,30 @@ mod tests {
             Some(Err(Error::Protocol(paho_mqtt_codec::Error::PacketTooLarge)))
         ));
         assert!(sent_packets(&mut h).is_empty());
+    }
+
+    /// A packet only a client sends, or a second CONNACK, ends the session
+    /// as a Protocol Error (§4.13) rather than being passed over.
+    #[test]
+    fn test_client_only_packets_from_the_server_are_protocol_errors() {
+        let pkts = [
+            Packet::PingReq,
+            Packet::ConnAck(ConnAck::new(false, ReasonCode::Success)),
+            Packet::Subscribe(paho_mqtt_codec::Subscribe::new(
+                1,
+                vec![paho_mqtt_codec::Subscription::new("a", QoS::QoS0)],
+            )),
+            Packet::Unsubscribe(paho_mqtt_codec::Unsubscribe::new(1, vec!["a".into()])),
+        ];
+        for pkt in pkts {
+            let mut h = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+            let ty = pkt.packet_type();
+            let res = h.session.handle_packet(pkt);
+            assert!(
+                matches!(&res, Err(e) if disconnect_reason(e) == Some(ReasonCode::ProtocolError)),
+                "{ty:?}: {res:?}"
+            );
+        }
     }
 
     /// A PUBREC or PUBREL for a packet identifier the client does not hold
