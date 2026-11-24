@@ -256,8 +256,8 @@ impl PropertyContext {
 
 impl PropertyId {
     /// Returns `true` if the specification allows this property in the
-    /// given context (MQTT v5 §2.2.2.2, Table 2-4). Including a property
-    /// where it is not allowed is a Protocol Error.
+    /// given context (MQTT v5 §2.2.2.2, Table 2-4). A packet received with a
+    /// property where it is not allowed is a Malformed Packet (§2.2.2.2).
     #[inline]
     pub fn is_allowed_in(self, ctx: impl Into<PropertyContext>) -> bool {
         ctx.into().allowed_ids() & (1 << (self as u8)) != 0
@@ -1335,6 +1335,11 @@ impl Properties {
     /// (§3.8.2.1.2) — and that Authentication Data is accompanied by an
     /// Authentication Method. Returns [`Error::ProtocolError`] otherwise.
     ///
+    /// This is the check for a packet being built, where the error says the
+    /// caller broke a rule. A property found in the wrong packet when
+    /// *decoding* is an [`Error::MalformedPacket`], which is what §2.2.2.2
+    /// calls the packet that carries it.
+    ///
     /// Packet encoders call this; use it directly when assembling properties
     /// for a packet to catch a misplaced one early.
     #[inline]
@@ -1409,8 +1414,10 @@ impl Properties {
         let mut saw_sub_id = false;
         while payload.has_remaining() {
             let prop = Property::decode(&mut payload)?; // validated
+            // "A Control Packet which contains an Identifier which is not
+            // valid for its packet type ... is a Malformed Packet" (§2.2.2.2).
             if allowed & (1 << (prop.property_id() as u8)) == 0 {
-                return Err(Error::ProtocolError);
+                return Err(Error::MalformedPacket);
             }
             seen.note(prop.property_id())?;
             if prop.property_id() == PropertyId::SubscriptionIdentifier {
@@ -2198,14 +2205,15 @@ mod tests {
 
     #[test]
     fn test_decode_in_rejects_property_from_wrong_packet() {
-        // MaximumQoS = 1 is a valid property, but not in a CONNECT.
+        // MaximumQoS = 1 is a valid property, but not in a CONNECT: a
+        // Malformed Packet (§2.2.2.2).
         let mut src = BytesMut::new();
         src.put_u8(2);
         src.put_slice(&[0x24, 0x01]);
         let bytes = src.freeze();
         assert_eq!(
             Properties::decode_in(&mut bytes.clone(), v5(), PacketType::Connect),
-            Err(Error::ProtocolError)
+            Err(Error::MalformedPacket)
         );
         assert!(Properties::decode_in(&mut bytes.clone(), v5(), PacketType::ConnAck).is_ok());
         // The context-free decoder still accepts it.

@@ -1537,7 +1537,7 @@ mod tests {
         dst.put_u16(0);
         c.properties.encode(&mut dst, v5()).unwrap(); // Properties::encode has no context
         put_utf8("c", &mut dst).unwrap();
-        assert_eq!(Connect::decode(dst.freeze()), Err(Error::ProtocolError));
+        assert_eq!(Connect::decode(dst.freeze()), Err(Error::MalformedPacket));
     }
 
     // ---- field length limits ----
