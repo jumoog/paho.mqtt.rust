@@ -278,6 +278,25 @@ async fn recv_connack<B: Backend>(
         }
         while let Some(raw) = RawPacket::decode_max(buf, p.max_packet_size())? {
             match Packet::from_raw(raw, p.ver)? {
+                // A client that started clean has no session state, so a
+                // server saying it resumed one is in error, and the client
+                // must close the connection (v5 [MQTT-3.2.2-4], v3.1.1
+                // §3.2.2.2). On v5 it says why first (§4.13).
+                Packet::ConnAck(ack)
+                    if p.clean_start && ack.session_present && !ack.reason_code.is_err() =>
+                {
+                    if p.ver.is_v5() {
+                        let mut out = BytesMut::with_capacity(4);
+                        let bye = Disconnect::with_properties(ReasonCode::ProtocolError, None);
+                        if Packet::Disconnect(bye).encode(&mut out, p.ver).is_ok() {
+                            let _ = B::write_all(writer, &out).await;
+                            let _ = B::flush(writer).await;
+                        }
+                    }
+                    return Err(Error::ProtocolViolation(
+                        "server set Session Present on a clean start",
+                    ));
+                }
                 Packet::ConnAck(ack) => return Ok(ack),
                 // Enhanced authentication: the broker challenges, the
                 // handler answers, and this repeats until a CONNACK
@@ -4806,9 +4825,49 @@ mod tests {
             &ack(false)
         ));
 
-        // A clean start is never resumed, even if a server wrongly says so.
+        // A clean start is never resumed, even if a server wrongly says so
+        // (`recv_connack` refuses that CONNACK in any case).
         for ver in [MqttVersion::V3_1, MqttVersion::V3_1_1, MqttVersion::V5] {
             assert!(!session_resumed(&params(ver, true), &ack(true)), "{ver}");
+        }
+    }
+
+    /// A server that sets Session Present on a clean start is in error: the
+    /// connect fails, and a v5 client says why with DISCONNECT 0x82 before
+    /// closing [MQTT-3.2.2-4]. Without a clean start it is a resumption.
+    #[test]
+    fn test_session_present_on_clean_start_closes() {
+        for ver in [MqttVersion::V3_1_1, MqttVersion::V5] {
+            let mut ack = BytesMut::new();
+            Packet::ConnAck(ConnAck::new(true, ReasonCode::Success))
+                .encode(&mut ack, ver)
+                .unwrap();
+            let ack = ack.to_vec();
+            let mut reader = MockReader::open_with([ack.clone()]);
+            let mut writer = MockWriter::default();
+            let mut buf = BytesMut::new();
+            let res = futures::executor::block_on(recv_connack::<MockBackend>(
+                &mut reader,
+                &mut writer,
+                &mut buf,
+                &params(ver, true),
+            ));
+            assert!(matches!(res, Err(Error::ProtocolViolation(_))), "{ver}");
+            let sent = writer.wire().bytes.clone();
+            if ver.is_v5() {
+                assert_eq!(&sent[..], &[0xE0, 0x01, 0x82]);
+            } else {
+                assert!(sent.is_empty());
+            }
+
+            let mut reader = MockReader::open_with([ack]);
+            let res = futures::executor::block_on(recv_connack::<MockBackend>(
+                &mut reader,
+                &mut MockWriter::default(),
+                &mut BytesMut::new(),
+                &params(ver, false),
+            ));
+            assert!(res.unwrap().session_present, "{ver}");
         }
     }
 
