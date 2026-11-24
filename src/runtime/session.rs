@@ -831,6 +831,16 @@ impl SessionState {
         }
     }
 
+    /// Marks every record as waiting for a window slot, as at the start of
+    /// a new connection, where none of them has been sent yet.
+    fn mark_all_unsent(&mut self) {
+        for rec in self.inflight.values_mut() {
+            rec.sent = false;
+        }
+        self.sent_count = 0;
+        self.check_sent_count();
+    }
+
     /// Number of records occupying a window slot.
     fn sent_count(&self) -> usize {
         self.sent_count
@@ -1793,6 +1803,13 @@ impl<B: Backend> Session<B> {
         // One that cannot be queued again fails alone (see
         // `send_inflight`): this server's maximum packet size may be smaller
         // than that of the one it first went to.
+        //
+        // Nothing is in flight on a new connection, so the window starts
+        // empty. Counting the slots the last connection held would hold
+        // back the oldest messages while later ones went first (§4.6), and
+        // with a full window nothing would be sent at all until an
+        // acknowledgement came that never could.
+        self.state.mark_all_unsent();
         for item in self.state.resend_order() {
             match item {
                 Resend::Publish(id) if self.inflight_slot_free() => self.send_inflight(id),
@@ -5083,6 +5100,74 @@ mod tests {
             assert_eq!(rsp.reason_codes, [ReasonCode::NoSubscriptionFound]);
             assert!(s.state.pending_sub.is_empty() && s.state.pending_unsub.is_empty());
         }
+    }
+
+    /// The window starts empty on a new connection. Publishes left in
+    /// flight when one ends are re-sent on the next in their original order
+    /// (§4.6), the oldest first, as many as the window takes; a full window
+    /// carried over held the oldest back behind the others, and with a
+    /// window of one sent nothing at all.
+    #[test]
+    fn test_resume_resends_in_order_within_a_full_window() {
+        for window in [1usize, 2, 3] {
+            let mut first = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+            first.session.limits.max_inflight = window;
+            let mut toks = Vec::new();
+            for topic in ["a", "b", "c"] {
+                let (tok, c) = publish_cmd(topic, QoS::QoS1, Bytes::from_static(b"x"));
+                first.session.handle_command(c).unwrap();
+                toks.push(tok);
+            }
+            let _ = sent_packets(&mut first);
+            // The deferred ones are buffered by the run loop between
+            // connections; only what went out stays in the session state.
+            let state = std::mem::take(&mut first.session.state);
+            drop(first);
+
+            let mut second = harness(BytesMut::new(), Duration::ZERO, state);
+            second.session.limits.max_inflight = window;
+            second.session.resume(true);
+            let resent: Vec<String> = sent_packets(&mut second).iter().map(describe).collect();
+            let expected: Vec<String> = ["a", "b", "c"][..window]
+                .iter()
+                .enumerate()
+                .map(|(i, t)| format!("PUBLISH {t} Some({}) dup=true", i + 1))
+                .collect();
+            assert_eq!(resent, expected, "window = {window}");
+        }
+
+        // A smaller window on the new connection: the oldest go first and
+        // the rest follow, in order, as acknowledgements free slots.
+        let mut first = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+        let mut toks = Vec::new();
+        for topic in ["a", "b", "c"] {
+            let (tok, c) = publish_cmd(topic, QoS::QoS1, Bytes::from_static(b"x"));
+            first.session.handle_command(c).unwrap();
+            toks.push(tok);
+        }
+        let _ = sent_packets(&mut first);
+        let state = std::mem::take(&mut first.session.state);
+        drop(first);
+
+        let mut second = harness(BytesMut::new(), Duration::ZERO, state);
+        second.session.limits.max_inflight = 1;
+        second.session.resume(true);
+        let mut resent: Vec<String> = sent_packets(&mut second).iter().map(describe).collect();
+        for id in [1, 2] {
+            second
+                .session
+                .handle_packet(Packet::PubAck(PubAck::new(id)))
+                .unwrap();
+            resent.extend(sent_packets(&mut second).iter().map(describe));
+        }
+        assert_eq!(
+            resent,
+            [
+                "PUBLISH a Some(1) dup=true",
+                "PUBLISH b Some(2) dup=true",
+                "PUBLISH c Some(3) dup=true",
+            ]
+        );
     }
 
     /// A SUBSCRIBE or UNSUBSCRIBE the codec will not encode — a bad filter,
