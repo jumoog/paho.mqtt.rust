@@ -594,6 +594,23 @@ impl AsyncClient {
             properties: msg.props.clone(),
         });
 
+        // Only v5 lets a client leave its identifier for the server to
+        // assign. v3.1.1 allows an empty one for a clean session alone
+        // ([MQTT-3.1.3-7]) and v3.1 not at all (1 to 23 characters, §3.1):
+        // the server would refuse the CONNECT with return code 2.
+        if self.inner.opts.client_id.is_empty()
+            && (ver == MqttVersion::V3_1 || (ver == MqttVersion::V3_1_1 && !opts.clean_start))
+        {
+            return Err(Error::InvalidArgument(
+                if ver == MqttVersion::V3_1 {
+                    "MQTT v3.1 needs a client ID"
+                } else {
+                    "an empty client ID needs a clean session on MQTT v3.1.1"
+                }
+                .into(),
+            ));
+        }
+
         // Everything that can be checked here has been: a connect refused
         // above leaves the client's version and options as they were.
         self.set_mqtt_version(ver);
@@ -2977,6 +2994,47 @@ mod tests {
             cli.try_connect(opts),
             Err(Error::InvalidArgument(msg)) if msg.contains("notaport")
         ));
+    }
+
+    /// Only v5 has the server assign a client ID. An empty one is refused
+    /// before anything is sent on v3.1.1 without a clean session
+    /// ([MQTT-3.1.3-7]) and on v3.1 always; the server would answer either
+    /// with return code 2.
+    #[test]
+    fn test_try_connect_rejects_an_empty_client_id_v3_forbids() {
+        use crate::ConnectOptionsBuilder as B;
+        let client = |id: &str| {
+            AsyncClient::new(
+                CreateOptionsBuilder::new()
+                    .server_uri("mqtt://localhost:1883")
+                    .client_id(id)
+                    .finalize(),
+            )
+            .unwrap()
+        };
+        let opts = |ver, clean| {
+            let mut b = B::with_mqtt_version(ver);
+            b.clean_start(clean);
+            b.finalize()
+        };
+        let refused = |r: Result<ConnectToken>| matches!(r, Err(Error::InvalidArgument(_)));
+
+        let anon = client("");
+        assert!(refused(anon.try_connect(opts(MqttVersion::V3_1_1, false))));
+        assert!(refused(anon.try_connect(opts(MqttVersion::V3_1, false))));
+        assert!(refused(anon.try_connect(opts(MqttVersion::V3_1, true))));
+        assert!(anon.try_connect(opts(MqttVersion::V3_1_1, true)).is_ok());
+        assert!(client("").try_connect(opts(MqttVersion::V5, false)).is_ok());
+        assert!(
+            client("me")
+                .try_connect(opts(MqttVersion::V3_1_1, false))
+                .is_ok()
+        );
+        assert!(
+            client("me")
+                .try_connect(opts(MqttVersion::V3_1, false))
+                .is_ok()
+        );
     }
 
     /// With the command channel closed the connect can't be queued.

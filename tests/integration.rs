@@ -2893,7 +2893,15 @@ fn test_session_that_ends_with_its_connection_is_discarded() {
             _ => common::Reply::none(),
         });
 
-        let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+        // With an identifier: v3 has none assigned by the server, and
+        // v3.1 allows no empty one.
+        let cli = mqtt::AsyncClient::new(
+            mqtt::CreateOptionsBuilder::new()
+                .server_uri(&broker.uri)
+                .client_id("ends")
+                .finalize(),
+        )
+        .unwrap();
         let opts = |clean: bool| {
             let mut b = mqtt::ConnectOptionsBuilder::with_mqtt_version(ver);
             if ver == mqtt::MQTT_VERSION_5 {
