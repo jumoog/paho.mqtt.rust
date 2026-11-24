@@ -562,7 +562,9 @@ impl Property {
             ReceiveMaximum(n) | TopicAlias(n) => *n > 0,
             MaximumPacketSize(n) => *n > 0,
             SubscriptionIdentifier(n) => *n > 0,
-            ResponseTopic(t) => !t.bytes().any(|b| b == b'+' || b == b'#'),
+            // A Topic Name (§3.3.2.3.5): at least one character
+            // ([MQTT-4.7.3-1]) and no wildcards ([MQTT-3.3.2-14]).
+            ResponseTopic(t) => !t.is_empty() && !t.bytes().any(|b| b == b'+' || b == b'#'),
             _ => true,
         };
         if ok {
@@ -2136,8 +2138,8 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_response_topic_rejects_wildcards() {
-        for t in ["a/#", "a/+/b", "+", "#"] {
+    fn test_validate_response_topic_rejects_wildcards_and_empty() {
+        for t in ["a/#", "a/+/b", "+", "#", ""] {
             assert_eq!(
                 Property::ResponseTopic(t.into()).validate(),
                 Err(Error::ProtocolError),
